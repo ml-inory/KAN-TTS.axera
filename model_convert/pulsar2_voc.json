@@ -1,0 +1,46 @@
+{
+  "input": "/workspace/export/voc.onnx",
+  "output_dir": "/workspace/compile",
+  "output_name": "voc.axmodel",
+  "work_dir": "/workspace/compile/work_voc",
+  "model_type": "ONNX",
+  "target_hardware": "AX650",
+  "npu_mode": "NPU3",
+  "input_shapes": "",
+  "onnx_opt": {
+    "disable_onnx_optimization": true,
+    "enable_onnxsim": false,
+    "model_check": true,
+    "disable_transformation_check": true
+  },
+  "quant": {
+    "input_configs": [
+      {
+        "tensor_name": "mel",
+        "calibration_dataset": "/workspace/export/calib_data/voc_mel.tar.gz",
+        "calibration_format": "Numpy",
+        "calibration_size": 4,
+        "calibration_mean": [],
+        "calibration_std": []
+      }
+    ],
+    "calibration_method": "MinMax",
+    "precision_analysis": true,
+    "precision_analysis_method": "EndToEnd",
+    "highest_mix_precision": false
+  },
+  "compiler": {
+    "check": 3,
+    "enable_tile_mode": true
+  },
+  "input_processors": [
+    {
+      "tensor_name": "mel",
+      "tensor_format": "RGB",
+      "tensor_layout": "NCHW",
+      "src_format": "RGB",
+      "src_dtype": "FP32",
+      "src_layout": "NCHW"
+    }
+  ]
+}
