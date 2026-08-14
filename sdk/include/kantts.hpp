@@ -59,7 +59,8 @@ public:
     std::vector<float> SynthesizeSymbols(const std::vector<std::string>& symbols);
 
 private:
-    std::unique_ptr<ModelSession> enc_, voc_;
+    std::unique_ptr<ModelSession> enc_, voc_, pe_, dur_, post_, dec_;
+    std::string model_dir_;
     Weights w_;
     std::unique_ptr<Frontend> frontend_;
 };

@@ -2,26 +2,31 @@
 
 将 [modelscope/KAN-TTS](https://github.com/modelscope/KAN-TTS)（SamBERT + HiFi-GAN，中文 16k，发音人 zhitian_emo）部署到 AX650（NPU3）的 C++ 推理包。
 
-## 架构（混合部署）
+## 架构（除 PNCA 解码外全 NPU）
 
 | 模块 | 位置 | 说明 |
 |------|------|------|
 | 前端（文本→符号） | 主机 x86 | ttsfrd，产出 symbols.txt |
 | AM 编码器 enc | 板端 NPU | am_enc.axmodel（U16 PTQ） |
 | 前端 embedding/位置编码 | 板端 CPU | 查表生成 x_emb/attn_mask/mask_f |
-| 韵律/时长/PNCA 解码/Postnet | 板端 CPU | 自研 C++（float32） |
+| 韵律 pitch/energy | 板端 NPU | pitch_energy.axmodel |
+| 时长 duration | 板端 NPU | duration.axmodel |
+| PNCA 解码 | 板端 CPU | 自研 C++（float32，保持精度） |
+| Postnet | 板端 NPU | postnet.axmodel |
 | 声码器 voc | 板端 NPU | voc.axmodel（INT8） |
 
-> enc 曾尝试 INT8/SmoothQuant（text_hid cosine 0.99）与 QAT（0.9996，但 Pulsar2
-> QuantONNX 导出有工具链缺陷无法编译）。最终采用剥离 embedding/mask 后的纯
-> transformer 图 + U16 PTQ（text_hid cosine 0.9901），实际听感自然（RTF 0.58）。
+> am_dec（PNCA 自回归解码）曾尝试 PTQ 与 QAT 上 NPU：PTQ AR 循环精度不稳定；
+> QAT（S16 对称 + 闭环序列训练）单步 dec_out cosine 0.979，但 kv 状态误差在
+> 42 步 AR 循环中累积，闭环 mel 达不到可交付听感，故解码保持 CPU（float32）。
+> 其余模块（pitch/energy/duration/postnet）NPU 化已板端验证无质量退化
+> （对齐后 mel cosine 0.98，RTF 0.32）。
 > 句末自动拼接 0.3s 静音，避免尾音听不清。
 
 ## 目录
 
 ```
 kantts-tts-ax650/
-  model/            am_enc.axmodel + voc.axmodel + host_weights/ + resource/ + am_config.yaml
+  model/            am_enc/pitch_energy/duration/postnet/voc .axmodel + host_weights/ + resource/ + am_config.yaml
   sdk/              C++ 源码 + axrt 库（ax_engine/ax_sys）+ build.sh
   sdk/tools/        text_to_symbols.py（主机 x86，ttsfrd）
   example/
@@ -49,7 +54,12 @@ kantts-tts-ax650/
    LD_LIBRARY_PATH=/soc/lib ./sdk/kantts_tts model model/resource symbols.txt out.wav
    ```
 
-   示例输出：`输出 out.wav（1.57s 音频，合成 1.09s，RTF=0.69）`
+   默认配置：enc/韵律/时长/postnet/voc 走 NPU，PNCA 解码走 CPU。
+   示例输出：`输出 out.wav（1.84s 音频，合成 0.58s，RTF=0.32）`
+
+   环境变量开关（实验）：
+   - `KANTTS_NPU_DEC=1`：PNCA 解码也走 NPU（am_dec.axmodel，QAT 实验产物，精度未达交付标准）
+   - `KANTTS_CPU_PRED=1`：韵律/时长回退 CPU（float32）
 
 ## 板端依赖
 
@@ -60,13 +70,15 @@ kantts-tts-ax650/
 
 （测试文本："北京今天天气怎么样"）
 
-| 阶段 | 指标 |
+| 模块 | 板端对分 |
 |------|------|
-| ling 编码 | 与官方 ttsfrd 逐项一致（T=22） |
-| enc text_hid | cosine 1.0（CPU FP32） |
-| durations / memory | 与官方一致（M=42，lr_len=126） |
-| dec / postnet mel | cosine 1.0 / rms 0.8041=0.8139 |
-| 最终 wav | cosine 0.973 / 频谱 0.996（voc INT8） |
+| enc text_hid | cosine 0.9901（U16 PTQ，听感自然） |
+| pitch / energy | cosine 0.996 / 0.962 |
+| log_dur | cosine 0.9999 |
+| postnet mel | cosine 0.993 |
+| 整链 mel（CPU vs NPU 预测器，DTW 对齐） | cosine 0.982 |
+| voc（INT8） | wav cosine 0.973 |
+| RTF | 0.32（解码 CPU，其余 NPU） |
 
 ## 示例音频
 
@@ -77,6 +89,7 @@ kantts-tts-ax650/
 ## 已知限制
 
 - 前端（文本→符号）依赖主机 ttsfrd，不在板端运行；embedding/位置编码查表在板端 CPU
-- enc 为 U16 PTQ（text_hid cosine 0.9901）、voc 为 INT8（0.973 cosine）；
-  如需更高精度可走 QAT（见 qat/ 目录，待 Pulsar2 修复 QuantONNX 导出）
+- PNCA 解码在 CPU（float32），其余全 NPU；RTF 0.32
+- 时长 NPU 化后个别音节帧数可能与 CPU 参考差 1（取整敏感），听感为节奏微差、内容一致
+- enc 为 U16 PTQ、voc 为 INT8；如需更高精度可走 QAT（见 qat/ 目录）
 - 句末自动拼接 0.3s 静音（16k）

@@ -714,6 +714,10 @@ KanttsPipeline::KanttsPipeline(const std::string& model_dir, const std::string& 
                                const std::string& am_config)
     : enc_(new ModelSession(model_dir + "/am_enc.axmodel")),
       voc_(new ModelSession(model_dir + "/voc.axmodel")),
+      pe_(new ModelSession(model_dir + "/pitch_energy.axmodel")),
+      dur_(new ModelSession(model_dir + "/duration.axmodel")),
+      post_(new ModelSession(model_dir + "/postnet.axmodel")),
+      model_dir_(model_dir),
       frontend_(new Frontend(resource_dir, am_config)) {
     w_.Load(model_dir + "/host_weights");
     std::fprintf(stderr, "[stage] weights loaded\n");
@@ -800,7 +804,109 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
             }
             std::fprintf(stderr, "[dbg] 使用参考 memory（%d 行）\n", (int)memory.size() / 160);
         } else {
-            BuildMemory(text_hid, spk_hid, emo_hid, w_, T, memory, lr_len, durations);
+            // pitch/energy/duration 默认 NPU（KANTTS_CPU_PRED 回退 CPU）
+            std::vector<float> var_in(T * 96);
+            for (int t = 0; t < T; ++t)
+                for (int c = 0; c < 32; ++c) {
+                    var_in[t * 96 + c] = text_hid[t * 32 + c];
+                    var_in[t * 96 + 32 + c] = spk_hid[t * 32 + c];
+                    var_in[t * 96 + 64 + c] = emo_hid[t * 32 + c];
+                }
+            std::vector<float> pitch(T), energy(T);
+            if (!std::getenv("KANTTS_CPU_PRED")) {
+                std::vector<float> var_pad(128 * 96, 0.0f);
+                std::copy(var_in.begin(), var_in.end(), var_pad.begin());
+                pe_->SetInput("var_in", var_pad.data(), var_pad.size() * 4);
+                pe_->Run();
+                pe_->GetOutput("pitch", pitch.data(), pitch.size() * 4);
+                pe_->GetOutput("energy", energy.data(), energy.size() * 4);
+            } else {
+                auto p = VarFsmnRnnPredictor(var_in, w_, "pitch", T, 96);
+                auto e = VarFsmnRnnPredictor(var_in, w_, "energy", T, 96);
+                pitch = std::move(p);
+                energy = std::move(e);
+            }
+            std::vector<float> pe_c, ee_c;
+            Conv1dSame(pitch, w_.Get("pitch_emb_w"), w_.Get("pitch_emb_b"), T, 1, 32, 9, pe_c);
+            Conv1dSame(energy, w_.Get("energy_emb_w"), w_.Get("energy_emb_b"), T, 1, 32, 9, ee_c);
+            std::vector<float> aug(T * 32);
+            for (int i = 0; i < T * 32; ++i) aug[i] = text_hid[i] + pe_c[i] + ee_c[i];
+            std::vector<float> cond(T * 96);
+            for (int t = 0; t < T; ++t)
+                for (int c = 0; c < 32; ++c) {
+                    cond[t * 96 + c] = aug[t * 32 + c];
+                    cond[t * 96 + 32 + c] = spk_hid[t * 32 + c];
+                    cond[t * 96 + 64 + c] = emo_hid[t * 32 + c];
+                }
+            std::vector<float> log_dur(T);
+            if (!std::getenv("KANTTS_CPU_PRED")) {
+                std::vector<float> cond_pad(22 * 96, 0.0f);
+                std::copy(cond.begin(), cond.end(), cond_pad.begin());
+                dur_->SetInput("cond", cond_pad.data(), cond_pad.size() * 4);
+                dur_->Run();
+                dur_->GetOutput("log_dur", log_dur.data(), log_dur.size() * 4);
+            } else {
+                log_dur = DurationAr(cond, w_, T, 96);
+            }
+            if (std::getenv("KANTTS_DUMP_ENC")) {
+                std::fprintf(stderr, "[dbg-npu] pitch[0..3]=%.4f %.4f %.4f %.4f energy[0..3]=%.4f %.4f %.4f %.4f log_dur[0..3]=%.4f %.4f %.4f %.4f\n",
+                             pitch[0], pitch[1], pitch[2], pitch[3],
+                             energy[0], energy[1], energy[2], energy[3],
+                             log_dur[0], log_dur[1], log_dur[2], log_dur[3]);
+            }
+            durations.resize(T);
+            int sum = 0;
+            std::vector<int> reps(T);
+            for (int t = 0; t < T; ++t) {
+                durations[t] = std::exp(log_dur[t]) - 1.0f;
+                reps[t] = (int)(durations[t] + 0.5f);
+                sum += reps[t];
+            }
+            if (std::getenv("KANTTS_DUMP_ENC")) {
+                std::fprintf(stderr, "[dbg-npu] log_dur all:");
+                for (int t = 0; t < T; ++t) std::fprintf(stderr, " %.3f", log_dur[t]);
+                std::fprintf(stderr, " | reps sum=%d\n", sum);
+            }
+            int pad = 3 - sum % 3;
+            if (pad == 3) pad = 0;
+            int P = sum + pad;
+            auto expand = [&](const std::vector<float>& src, std::vector<float>& dst) {
+                dst.assign(P * 32, 0.0f);
+                int pos = 0;
+                for (int t = 0; t < T; ++t)
+                    for (int r = 0; r < reps[t]; ++r) {
+                        std::copy(src.begin() + t * 32, src.begin() + (t + 1) * 32,
+                                  dst.begin() + (pos++) * 32);
+                    }
+            };
+            std::vector<float> lr_text, lr_emo, lr_spk;
+            expand(aug, lr_text);
+            expand(emo_hid, lr_emo);
+            expand(spk_hid, lr_spk);
+            std::vector<float> rc(T + 1, 0);
+            for (int t = 0; t < T; ++t) rc[t + 1] = rc[t] + reps[t];
+            std::vector<float> lr_pos(P * 32, 0.0f);
+            for (int p = 0; p < P; ++p) {
+                int ph = 0;
+                for (int t = 0; t < T; ++t)
+                    if (rc[t] <= p && p < rc[t + 1]) { ph = p - rc[t] + 1; break; }
+                for (int c = 0; c < 32; ++c) {
+                    float inv = std::pow(10000.0f, 2.0f * (c / 2) / 32.0f);
+                    float v = ph / inv;
+                    lr_pos[p * 32 + c] = (c % 2 == 0) ? std::sin(v) : std::cos(v);
+                }
+            }
+            for (int i = 0; i < P * 32; ++i) lr_text[i] += lr_pos[i];
+            int MM = P / 3;
+            memory.assign(MM * 160, 0.0f);
+            for (int m = 0; m < MM; ++m) {
+                for (int c = 0; c < 96; ++c) memory[m * 160 + c] = lr_text[m * 96 + c];
+                for (int c = 0; c < 32; ++c) {
+                    memory[m * 160 + 96 + c] = lr_spk[m * 96 + c];
+                    memory[m * 160 + 128 + c] = lr_emo[m * 96 + c];
+                }
+            }
+            lr_len = sum;
         }
         int M = (int)memory.size() / 160;
         std::fprintf(stderr, "[stage] memory M=%d lr_len=%d\n", M, lr_len);
@@ -812,25 +918,92 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
         }
         int x_band = (int)(*std::max_element(durations.begin(), durations.end()) / 3.0f + 0.5f);
         std::fprintf(stderr, "[stage] x_band=%d\n", x_band);
-        Decoder dec(w_);
-        dec.Prepare(memory);
-        std::fprintf(stderr, "[timing] host(预测+memory) %.0fms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_stage).count());
-        t_stage = std::chrono::steady_clock::now();
-        std::vector<float> xk(12 * 8 * 270 * 16, 0.0f), xv(12 * 8 * 270 * 16, 0.0f);
-        std::vector<float> frame(80, 0.0f), out;
         std::vector<float> dec_all(M * 3 * 80);
         double dec_sum = 0;
-        for (int s = 0; s < M; ++s) {
-            std::vector<float> mem_step(memory.begin() + s * 160, memory.begin() + (s + 1) * 160);
-            dec.Step(frame, mem_step, xk, xv, s, x_band, out);
-            std::copy(out.begin(), out.begin() + 240, dec_all.begin() + s * 240);
-            std::copy(out.begin() + 160, out.begin() + 240, frame.begin());
+        std::fprintf(stderr, "[timing] host(预测+memory) %.0fms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_stage).count());
+        t_stage = std::chrono::steady_clock::now();
+        // 交付配置：am_dec（PNCA 解码）默认 CPU，其余（enc/pe/dur/postnet/voc）全 NPU；
+        // KANTTS_NPU_DEC=1 可切回 NPU 解码（QAT 实验用）。
+        const bool dec_npu = std::getenv("KANTTS_NPU_DEC") != nullptr;
+        if (dec_npu) {
+            if (!dec_) dec_.reset(new ModelSession(model_dir_ + "/am_dec.axmodel"));
+            static const char* k_names[12] = {
+                "dequantize_per_tensor_101", "dequantize_per_tensor_166",
+                "dequantize_per_tensor_231", "dequantize_per_tensor_296",
+                "dequantize_per_tensor_361", "dequantize_per_tensor_426",
+                "dequantize_per_tensor_491", "dequantize_per_tensor_556",
+                "dequantize_per_tensor_621", "dequantize_per_tensor_686",
+                "dequantize_per_tensor_751", "dequantize_per_tensor_816"};
+            static const char* v_names[12] = {
+                "dequantize_per_tensor_103", "dequantize_per_tensor_168",
+                "dequantize_per_tensor_233", "dequantize_per_tensor_298",
+                "dequantize_per_tensor_363", "dequantize_per_tensor_428",
+                "dequantize_per_tensor_493", "dequantize_per_tensor_558",
+                "dequantize_per_tensor_623", "dequantize_per_tensor_688",
+                "dequantize_per_tensor_753", "dequantize_per_tensor_818"};
+            std::vector<float> mem_pad(270 * 160, 0.0f);
+            std::copy(memory.begin(), memory.end(), mem_pad.begin());
+            std::vector<float> xk(12 * 8 * 270 * 16, 0.0f), xv(12 * 8 * 270 * 16, 0.0f);
+            std::vector<float> frame(80, 0.0f), out(240), kbuf(8 * 16), vbuf(8 * 16);
+            int32_t xb = x_band, ml = M;
+            for (int s = 0; s < M; ++s) {
+                dec_->SetInput("mel_frame", frame.data(), frame.size() * 4);
+                dec_->SetInput("memory_step", memory.data() + s * 160, 160 * 4);
+                dec_->SetInput("memory", mem_pad.data(), mem_pad.size() * 4);
+                dec_->SetInput("x_k", xk.data(), xk.size() * 4);
+                dec_->SetInput("x_v", xv.data(), xv.size() * 4);
+                int32_t step_v = s;
+                dec_->SetInput("step", &step_v, 4);
+                dec_->SetInput("x_band", &xb, 4);
+                dec_->SetInput("h_band", &xb, 4);
+                dec_->SetInput("mem_len", &ml, 4);
+                dec_->Run();
+                dec_->GetOutput("output", out.data(), out.size() * 4);
+                std::copy(out.begin(), out.begin() + 240, dec_all.begin() + s * 240);
+                std::copy(out.begin() + 160, out.begin() + 240, frame.begin());
+                for (int li = 0; li < 12; ++li) {
+                    dec_->GetOutput(k_names[li], kbuf.data(), kbuf.size() * 4);
+                    dec_->GetOutput(v_names[li], vbuf.data(), vbuf.size() * 4);
+                    for (int h = 0; h < 8; ++h)
+                        for (int d = 0; d < 16; ++d) {
+                            xk[(li * 8 + h) * 270 * 16 + s * 16 + d] = kbuf[h * 16 + d];
+                            xv[(li * 8 + h) * 270 * 16 + s * 16 + d] = vbuf[h * 16 + d];
+                        }
+                }
+            }
+            std::fprintf(stderr, "[dbg] dec NPU %d 步\n", M);
+        } else {
+            Decoder dec(w_);
+            dec.Prepare(memory);
+            std::vector<float> xk(12 * 8 * 270 * 16, 0.0f), xv(12 * 8 * 270 * 16, 0.0f);
+            std::vector<float> frame(80, 0.0f), out;
+            for (int s = 0; s < M; ++s) {
+                std::vector<float> mem_step(memory.begin() + s * 160, memory.begin() + (s + 1) * 160);
+                dec.Step(frame, mem_step, xk, xv, s, x_band, out);
+                std::copy(out.begin(), out.begin() + 240, dec_all.begin() + s * 240);
+                std::copy(out.begin() + 160, out.begin() + 240, frame.begin());
+            }
         }
         for (size_t i = 0; i < dec_all.size(); ++i) dec_sum += dec_all[i] * dec_all[i];
         std::fprintf(stderr, "[dbg] dec rms=%.4f\n", std::sqrt(dec_sum / dec_all.size()));
         std::fprintf(stderr, "[timing] decode %d 步 %.0fms\n", M, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_stage).count());
         t_stage = std::chrono::steady_clock::now();
-        std::vector<float> mel = Postnet(dec_all, w_, M * 3);
+        std::vector<float> mel;
+        {
+            // postnet 模型固定 128 帧输入；M*3 可能超过 128，按 128 帧分块处理
+            const int Tf = M * 3;
+            for (int start = 0; start < Tf; start += 128) {
+                int n = std::min(128, Tf - start);
+                std::vector<float> dec_p(128 * 80, 0.0f);
+                std::copy(dec_all.begin() + start * 80, dec_all.begin() + (start + n) * 80,
+                          dec_p.begin());
+                post_->SetInput("dec", dec_p.data(), dec_p.size() * 4);
+                post_->Run();
+                std::vector<float> mel_p(128 * 80);
+                post_->GetOutput("output", mel_p.data(), mel_p.size() * 4);
+                mel.insert(mel.end(), mel_p.begin(), mel_p.begin() + n * 80);
+            }
+        }
         std::fprintf(stderr, "[timing] postnet %.0fms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_stage).count());
         t_stage = std::chrono::steady_clock::now();
         double mel_sum = 0;
