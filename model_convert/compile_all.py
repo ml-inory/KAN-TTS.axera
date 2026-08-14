@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""KAN-TTS 三模型 Pulsar2 编译驱动（NPU3，真实校准数据）。"""
+"""KAN-TTS NPU 模型 Pulsar2 编译驱动（NPU3，真实校准数据）。
+
+交付架构：enc/pitch_energy/duration/postnet/voc 全 NPU，PNCA 解码（am_dec）走 CPU。
+"""
 import json
 import sys
 from pathlib import Path
@@ -31,8 +34,8 @@ def shapes_str(path):
     )
 
 
-def build_config(name, onnx_name, calib_prefix, use_input_shapes=True, disable_opt=False,
-                 layer_configs=None):
+def build_config(name, onnx_name, calib_prefix, calib_size=4, use_input_shapes=True,
+                 disable_opt=False, layer_configs=None):
     onnx_path = TASK / "export" / onnx_name
     ins, _ = onnx_io(onnx_path)
     input_configs = []
@@ -41,12 +44,11 @@ def build_config(name, onnx_name, calib_prefix, use_input_shapes=True, disable_o
             "tensor_name": n,
             "calibration_dataset": f"/workspace/export/calib_data/{calib_prefix}_{n}.tar.gz",
             "calibration_format": "Numpy",
-            "calibration_size": 16,
+            "calibration_size": calib_size,
             "calibration_mean": [],
             "calibration_std": [],
         })
-    int_inputs = {"am_enc": ["inputs_ling", "inputs_emo", "inputs_spk", "inputs_len"],
-                  "am_dec": ["step", "x_band", "h_band", "mem_len"]}.get(name, [])
+    int_inputs = {"am_enc": ["inputs_ling", "inputs_emo", "inputs_spk", "inputs_len"]}.get(name, [])
     processors = []
     for n in ins:
         processors.append({
@@ -90,14 +92,17 @@ def build_config(name, onnx_name, calib_prefix, use_input_shapes=True, disable_o
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     models = [
-        ("am_enc", "am_enc.onnx", "enc"),
-        ("am_dec", "am_dec.onnx", "dec"),
-        ("voc", "voc.onnx", "voc"),
+        ("am_enc", "am_enc.onnx", "enc", 4),
+        ("pitch_energy", "pitch_energy_legacy_slim.onnx", "pe", 1),
+        ("duration", "duration_slim.onnx", "dur", 1),
+        ("postnet", "postnet_legacy_slim.onnx", "post", 1),
+        ("voc", "voc.onnx", "voc", 4),
     ]
-    for name, onnx_name, calib_prefix in models:
+    for name, onnx_name, calib_prefix, calib_size in models:
         if only and name != only:
             continue
-        cfg = build_config(name, onnx_name, calib_prefix, use_input_shapes=False, disable_opt=True)
+        cfg = build_config(name, onnx_name, calib_prefix, calib_size=calib_size,
+                           use_input_shapes=False, disable_opt=True)
         cfg_path = TASK / "compile" / f"pulsar2_{name}.json"
         cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         print(f"[compile] {name}: pulsar2 build --config compile/pulsar2_{name}.json")

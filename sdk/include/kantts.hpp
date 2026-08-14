@@ -65,9 +65,4 @@ private:
     std::unique_ptr<Frontend> frontend_;
 };
 
-// host 管线（供内部/测试使用）
-std::vector<float> HostPredictors(const Weights& w, const std::vector<float>& text_hid,
-                                  const std::vector<float>& spk_hid,
-                                  const std::vector<float>& emo_hid, int T);
-
 }  // namespace kantts

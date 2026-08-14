@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""为 am_enc / am_dec / voc 生成真实业务校准数据（tar.gz，npy 带 batch 维）。"""
+"""为 enc/pitch_energy/duration/postnet/voc 生成真实业务校准数据（tar.gz，npy 带 batch 维）。"""
 import tarfile
 from pathlib import Path
 
@@ -71,6 +71,32 @@ def main():
         dec_inputs["mem_len"].append(np.array([M], np.int32))
     for n, samples in dec_inputs.items():
         pack(f"dec_{n}", samples)
+
+    # ---- pitch_energy（var_in (1,128,96)）----
+    pe_samples = []
+    for d in utts:
+        T = d["var_in"].shape[1]
+        v = np.zeros((1, 128, 96), np.float32)
+        v[0, :T, :] = d["var_in"][0]
+        pe_samples.append(v)
+    pack("pe_var_in", pe_samples)
+
+    # ---- duration（cond (1,22,96)）----
+    dur_samples = []
+    for d in utts:
+        T = d["dur_cond"].shape[1]
+        c = np.zeros((1, 22, 96), np.float32)
+        c[0, :T, :] = d["dur_cond"][0]
+        dur_samples.append(c)
+    pack("dur_cond", dur_samples)
+
+    # ---- postnet（dec 拼接 (1,128,80)，用 utt0 步态）----
+    d0 = utts[0]
+    M = d0["memory"].shape[1]
+    dec_all = np.zeros((1, 128, 80), np.float32)
+    for s in range(min(M, 42)):
+        dec_all[0, s * 3:(s + 1) * 3, :] = d0[f"step_{s}_out"][0].reshape(3, 80)
+    pack("postnet_dec", [dec_all])
 
     # ---- voc（分块，块长 200 帧，重叠 10 帧）----
     voc_mels = []

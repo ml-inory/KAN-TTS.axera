@@ -58,8 +58,7 @@ kantts-tts-ax650/
    示例输出：`输出 out.wav（1.84s 音频，合成 0.58s，RTF=0.32）`
 
    环境变量开关（实验）：
-   - `KANTTS_NPU_DEC=1`：PNCA 解码也走 NPU（am_dec.axmodel，QAT 实验产物，精度未达交付标准）
-   - `KANTTS_CPU_PRED=1`：韵律/时长回退 CPU（float32）
+   - `KANTTS_NPU_DEC=1`：PNCA 解码也走 NPU（需自备 am_dec.axmodel，QAT 实验产物，精度未达交付标准）
 
 ## 板端依赖
 
