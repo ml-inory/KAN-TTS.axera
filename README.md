@@ -85,10 +85,16 @@ kantts-tts-ax650/
 
 [example/out.wav](example/out.wav)（"北京今天天气怎么样"，16kHz，句末含 0.3s 静音）
 
+<audio controls src="example/manjianghong.wav"></audio>
+
+[example/manjianghong.wav](example/manjianghong.wav)（《满江红·怒发冲冠》全词，16kHz，21.5s；
+长句自动按标点切分为 ≤22 符号的子段逐段合成拼接，RTF 0.38）
+
 ## 已知限制
 
 - 前端（文本→符号）依赖主机 ttsfrd，不在板端运行；embedding/位置编码查表在板端 CPU
 - PNCA 解码在 CPU（float32），其余全 NPU；RTF 0.32
+- 单句时长模型固定 22 帧：超过 22 个符号的长句由 SDK 自动按标点切分子段拼接
 - 时长 NPU 化后个别音节帧数可能与 CPU 参考差 1（取整敏感），听感为节奏微差、内容一致
 - enc 为 U16 PTQ、voc 为 INT8；如需更高精度可走 QAT（见 qat/ 目录）
 - 句末自动拼接 0.3s 静音（16k）
