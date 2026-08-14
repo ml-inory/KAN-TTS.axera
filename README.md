@@ -2,31 +2,31 @@
 
 将 [modelscope/KAN-TTS](https://github.com/modelscope/KAN-TTS)（SamBERT + HiFi-GAN，中文 16k，发音人 zhitian_emo）部署到 AX650（NPU3）的 C++ 推理包。
 
-## 架构（除 PNCA 解码外全 NPU）
+## 架构（全 NPU，除 PNCA 解码）
 
 | 模块 | 位置 | 说明 |
 |------|------|------|
 | 前端（文本→符号） | 主机 x86 | ttsfrd，产出 symbols.txt |
-| AM 编码器 enc | 板端 NPU | am_enc.axmodel（U16 PTQ） |
-| 前端 embedding/位置编码 | 板端 CPU | 查表生成 x_emb/attn_mask/mask_f |
-| 韵律 pitch/energy | 板端 NPU | pitch_energy.axmodel |
-| 时长 duration | 板端 NPU | duration.axmodel |
-| PNCA 解码 | 板端 CPU | 自研 C++（float32，保持精度） |
-| Postnet | 板端 NPU | postnet.axmodel |
+| AM 编码器 enc（含 embedding/位置编码） | 板端 NPU | am_enc.axmodel（INT8，输入 ling/emo/spk/len） |
+| 韵律 pitch/energy | 板端 NPU | pitch_energy.axmodel（INT8） |
+| 时长 duration | 板端 NPU | duration.axmodel（INT8，非自回归单次前向） |
+| PNCA 解码 dec | 板端 CPU | 自研 C++（float32，host_weights） |
+| Postnet | 板端 NPU | postnet.axmodel（INT8） |
 | 声码器 voc | 板端 NPU | voc.axmodel（INT8） |
 
-> am_dec（PNCA 自回归解码）曾尝试 PTQ 与 QAT 上 NPU：PTQ AR 循环精度不稳定；
-> QAT（S16 对称 + 闭环序列训练）单步 dec_out cosine 0.979，但 kv 状态误差在
-> 42 步 AR 循环中累积，闭环 mel 达不到可交付听感，故解码保持 CPU（float32）。
-> 其余模块（pitch/energy/duration/postnet）NPU 化已板端验证无质量退化
-> （对齐后 mel cosine 0.98，RTF 0.32）。
-> 句末自动拼接 0.3s 静音，避免尾音听不清。
+> 校准集为 104 句真实中文语料（覆盖数字/长句/标点，含"八十万对六十万，优势在我"等），
+> 由 pypinyin+jieba 生成 ttsfrd 风格符号（`tools/gen_calib.py`）。
+> 关键修复：`ax_engine.cpp` 增加 `AX_SYS_MflushCache / AX_SYS_MinvalidateCache`，
+> 修复多模型串行推理时缓存一致性问题（此前 NPU 输出逐次漂移）；
+> 移除"标点强制停顿"补丁（该补丁会把停顿帧喂给解码器导致音频损坏）。
+> 长句（>22 符号）按标点切分成 ≤22 子段，每段独立走全管线后拼接。
+> 句末自动拼接 0.3s 静音，避免尾音听不清；语速默认 1.4x（`KANTTS_SPEED` 可调）。
 
 ## 目录
 
 ```
 kantts-tts-ax650/
-  model/            am_enc/pitch_energy/duration/postnet/voc .axmodel + host_weights/ + resource/ + am_config.yaml
+  model/            am_enc/pitch_energy/duration/postnet/voc.axmodel + host_weights/ + resource/ + am_config.yaml
   sdk/              C++ 源码 + axrt 库（ax_engine/ax_sys）+ build.sh
   sdk/tools/        text_to_symbols.py（主机 x86，ttsfrd）
   example/
@@ -54,48 +54,29 @@ kantts-tts-ax650/
    LD_LIBRARY_PATH=/soc/lib ./sdk/kantts_tts model model/resource symbols.txt out.wav
    ```
 
-   默认配置：enc/韵律/时长/postnet/voc 走 NPU，PNCA 解码走 CPU。
-   示例输出：`输出 out.wav（1.84s 音频，合成 0.58s，RTF=0.32）`
-
-   环境变量开关（实验）：
-   - `KANTTS_NPU_DEC=1`：PNCA 解码也走 NPU（需自备 am_dec.axmodel，QAT 实验产物，精度未达交付标准）
+   示例：`输出 out.wav（2.44s 音频，合成 0.72s，RTF=0.30）`（北京例句）
 
 ## 板端依赖
 
 - AX650 / NPU3，`/soc/lib` 提供 ax_engine/ax_sys 运行时（或用包内 `sdk/axrt/lib`）
 - `sdk/axrt/lib/libonnxruntime.so.1.23.2`（aarch64，来自 onnxruntime 1.23.2 wheel）
 
-## 精度验证
+## 精度与效果验证（2026-08-14 重建后）
 
-（测试文本："北京今天天气怎么样"）
+（测试文本："北京今天天气怎么样" / "八十万对六十万，优势在我！"）
 
-| 模块 | 板端对分 |
+| 阶段 | 指标 |
 |------|------|
-| enc text_hid | cosine 0.9901（U16 PTQ，听感自然） |
-| pitch / energy | cosine 0.996 / 0.962 |
-| log_dur | cosine 0.9999 |
-| postnet mel | cosine 0.993 |
-| 整链 mel（CPU vs NPU 预测器，DTW 对齐） | cosine 0.982 |
-| voc（INT8） | wav cosine 0.973 |
-| RTF | 0.32（解码 CPU，其余 NPU） |
-
-## 示例音频
-
-<audio controls src="example/out.wav"></audio>
-
-[example/out.wav](example/out.wav)（"北京今天天气怎么样"，16kHz，句末含 0.3s 静音）
-
-<audio controls src="example/manjianghong.wav"></audio>
-
-[example/manjianghong.wav](example/manjianghong.wav)（《满江红·怒发冲冠》全词，16kHz，30.9s；
-长句自动按标点切分为 ≤22 符号的子段逐段合成拼接，语速默认 1.4x 放慢）
+| ling 编码 | 与官方 ttsfrd 逐项一致（T=22） |
+| enc text_hid | 板端 NPU vs 浮点 cosine 0.990 |
+| 重建模型编译校验 | am_enc/pitch_energy/duration/voc 余弦 ≥ 0.9999 |
+| 最终 wav | 北京句可识别；蒋介石台词 ASR = "80萬對60萬,優勢在我" |
 
 ## 已知限制
 
-- 前端（文本→符号）依赖主机 ttsfrd，不在板端运行；embedding/位置编码查表在板端 CPU
-- PNCA 解码在 CPU（float32），其余全 NPU；RTF 0.32
-- 单句时长模型固定 22 帧：超过 22 个符号的长句由 SDK 自动按标点切分子段拼接
-- 语速控制：`KANTTS_SPEED` 环境变量（默认 1.4，1.0=原速）
-- 时长 NPU 化后个别音节帧数可能与 CPU 参考差 1（取整敏感），听感为节奏微差、内容一致
-- enc 为 U16 PTQ、voc 为 INT8；如需更高精度可走 QAT（见 qat/ 目录）
+- 前端（文本→符号）依赖主机 ttsfrd，不在板端运行
+- postnet 保留原始编译版本（新导出 ONNX 含 ConstantOfShape/Pad 组合，
+  Pulsar2 无法编译，onnxsim 简化会破坏精度；原始模型精度正常）
+- dec 为 CPU（PNCA），如需 NPU 解码可用 `KANTTS_NPU_DEC=1`（实验性，
+  需要 am_dec.axmodel，QAT 导出在 Pulsar2 6.0 下因 per-channel DequantizeLinear 无法编译）
 - 句末自动拼接 0.3s 静音（16k）

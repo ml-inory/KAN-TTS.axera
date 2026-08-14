@@ -99,6 +99,7 @@ void ModelSession::SetInput(const std::string& name, const void* data, size_t by
     auto& buf = impl_->inputs[it->second];
     if (bytes > buf.nSize) throw std::runtime_error("input too large " + name);
     std::memcpy(buf.pVirAddr, data, bytes);
+    AX_SYS_MflushCache(buf.phyAddr, buf.pVirAddr, buf.nSize);
 }
 
 void ModelSession::Run() {
@@ -117,6 +118,7 @@ void ModelSession::GetOutput(const std::string& name, void* out, size_t bytes) c
     if (it == impl_->output_index.end()) throw std::runtime_error("no output named " + name);
     auto& buf = impl_->outputs[it->second];
     if (bytes > buf.nSize) bytes = buf.nSize;
+    AX_SYS_MinvalidateCache(buf.phyAddr, buf.pVirAddr, buf.nSize);
     std::memcpy(out, buf.pVirAddr, bytes);
 }
 

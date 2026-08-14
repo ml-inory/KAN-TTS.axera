@@ -91,11 +91,12 @@ def build_config(name, onnx_name, calib_prefix, calib_size=4, use_input_shapes=T
 
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
+    # 2026-08-14 重建：新校准集（104 句）+ 官方类导出 ONNX（pitch_energy/duration/postnet）
     models = [
-        ("am_enc", "am_enc.onnx", "enc", 4),
-        ("pitch_energy", "pitch_energy_legacy_slim.onnx", "pe", 1),
-        ("duration", "duration_slim.onnx", "dur", 1),
-        ("postnet", "postnet_legacy_slim.onnx", "post", 1),
+        ("am_enc", "am_enc.onnx", "enc", 64),
+        ("pitch_energy", "pitch_energy.onnx", "pe", 64),
+        ("duration", "duration.onnx", "dur", 64),
+        ("postnet", "postnet.onnx", "post", 64),
         ("voc", "voc.onnx", "voc", 4),
     ]
     for name, onnx_name, calib_prefix, calib_size in models:

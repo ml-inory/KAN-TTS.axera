@@ -635,64 +635,42 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
     const std::vector<std::string>& symbols) {
     std::vector<float> audio;
     for (const auto& sym : symbols) {
-        // 标点位置（{#N...} 停顿标记），切分后的段 duration 对标点预测可能为 0，需强制停顿
-        std::vector<int> punct_idx;
-        {
-            std::stringstream ss(sym);
-            std::string t;
-            int idx = 0;
-            while (ss >> t) {
-                if (t.size() >= 2 && t[0] == '{' && t[1] == '#') punct_idx.push_back(idx);
-                ++idx;
-            }
-        }
         auto in = frontend_->Encode(sym);
         auto t_stage = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[stage] encoded T=%d\n", in.T);
         int T = in.T;
-        // 长句（超过 NPU duration 22 帧上限）自动回退 CPU 管线（pitch/energy/duration/postnet），
-        // 不切分整句直接合成，避免切分导致时长/停顿失真。
-        const bool use_cpu = T > 22;
+        // 默认：main.cpp 已把长句按标点切成 ≤22 子段，全走 NPU（除 PNCA 解码）。
+        // KANTTS_CPU_LONG=1 时整句不切分，回退 CPU 管线（对照用）。
+// 诊断开关：KANTTS_CPU_ALL=1 时任意长度都走 CPU 韵律/时长/postnet（对照用）
+        const bool use_cpu = (T > 22 && std::getenv("KANTTS_CPU_LONG") != nullptr) ||
+                             std::getenv("KANTTS_CPU_ALL") != nullptr;
         if (use_cpu) std::fprintf(stderr, "[stage] 长句 T=%d -> CPU 管线\n", T);
-        constexpr int MT = 128, D = 512, U = 32;
-        const float* sy_w = w_.Get("sy_emb").data();      // (147,512)
-        const float* tone_w = w_.Get("tone_emb").data();   // (10,512)
-        const float* syll_w = w_.Get("syll_emb").data();   // (8,512)
-        const float* ws_w = w_.Get("ws_emb").data();       // (8,512)
-        const float* spk_w = w_.Get("spk_emb").data();     // (9,32)
-        const float* emo_w = w_.Get("emo_emb").data();     // (36,32)
-        const float* pos = w_.Get("pos_enc").data();       // (128,512)
-        std::vector<float> x_emb(MT * D, 0.0f), attn_mask(MT, 0.0f), mask_f(MT, 0.0f);
-        for (int t = 0; t < MT; ++t) {
-            bool valid = t < T;
-            mask_f[t] = valid ? 1.0f : 0.0f;
-            attn_mask[t] = valid ? 0.0f : -3e4f;
-            if (!valid) continue;
-            const int* l = &in.ling[t * 4];
-            for (int c = 0; c < D; ++c) {
-                float v = sy_w[l[0] * D + c] + tone_w[l[1] * D + c]
-                        + syll_w[l[2] * D + c] + ws_w[l[3] * D + c];
-                x_emb[t * D + c] = v * std::sqrt(128.0f) + pos[t * D + c];
-            }
-        }
+        constexpr int MT = 128, U = 32;
         std::vector<float> text_hid(MT * U), spk_hid(MT * U), emo_hid(MT * U);
-        for (int t = 0; t < MT; ++t) {
-            int s = in.spk[t], e = in.emo[t];
-            for (int c = 0; c < U; ++c) {
-                spk_hid[t * U + c] = spk_w[s * U + c];
-                emo_hid[t * U + c] = emo_w[e * U + c];
-            }
-        }
-        enc_->SetInput("x_emb", x_emb.data(), x_emb.size() * 4);
-        enc_->SetInput("attn_mask", attn_mask.data(), attn_mask.size() * 4);
-        enc_->SetInput("mask_f", mask_f.data(), mask_f.size() * 4);
+        enc_->SetInput("inputs_ling", in.ling.data(), in.ling.size() * 4);
+        enc_->SetInput("inputs_emo", in.emo.data(), in.emo.size() * 4);
+        enc_->SetInput("inputs_spk", in.spk.data(), in.spk.size() * 4);
+        enc_->SetInput("inputs_len", in.len.data(), in.len.size() * 4);
+        if (const char* le = std::getenv("KANTTS_LOAD_ENC")) {
+            // 诊断开关：从文件加载浮点 enc 输出（全 ONNX 对照用）
+            auto loadf = [&](const char* name, std::vector<float>& v) {
+                std::ifstream f(std::string(le) + "/" + name, std::ios::binary);
+                std::vector<char> b((std::istreambuf_iterator<char>(f)), {});
+                v.resize(b.size() / 4);
+                std::memcpy(v.data(), b.data(), b.size());
+            };
+            loadf("text.bin", text_hid);
+            loadf("spk.bin", spk_hid);
+            loadf("emo.bin", emo_hid);
+        } else {
         enc_->Run();
-        std::vector<float> th_all(MT * U);
-        enc_->GetOutput("output", th_all.data(), th_all.size() * 4);
-        text_hid.assign(th_all.begin(), th_all.end());
+        enc_->GetOutput("text_hid", text_hid.data(), text_hid.size() * 4);
+        enc_->GetOutput("spk_hid", spk_hid.data(), spk_hid.size() * 4);
+        enc_->GetOutput("emo_hid", emo_hid.data(), emo_hid.size() * 4);
         text_hid.resize(T * U);
         spk_hid.resize(T * U);
         emo_hid.resize(T * U);
+        }
         std::fprintf(stderr, "[timing] enc %.0fms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_stage).count());
         t_stage = std::chrono::steady_clock::now();
         if (std::getenv("KANTTS_DUMP_ENC")) {
@@ -784,23 +762,6 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
                 durations[t] = (std::exp(log_dur[t]) - 1.0f) * speed;
                 reps[t] = (int)(durations[t] + 0.5f);
                 sum += reps[t];
-            }
-            // 标点强制停顿：#1/#3 顿/逗号 ≈0.12s（10 帧），#4 句号 ≈0.2s（16 帧）
-            for (int pi : punct_idx) {
-                if (use_cpu) continue;
-                if (pi >= T) continue;
-                int min_reps = 10;
-                if (pi + 1 < T) {
-                    // 看该标点符号内容：#4 句号停顿更长
-                    std::stringstream ss(sym);
-                    std::string t;
-                    for (int k = 0; k <= pi; ++k) ss >> t;
-                    if (t.size() >= 3 && t[1] == '#' && t[2] == '4') min_reps = 16;
-                }
-                if (reps[pi] < min_reps) {
-                    sum += min_reps - reps[pi];
-                    reps[pi] = min_reps;
-                }
             }
             std::fprintf(stderr, "[stage] speed=%.2f reps_sum=%d\n", speed, sum);
             if (std::getenv("KANTTS_DUMP_ENC")) {
