@@ -500,6 +500,17 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
     const std::vector<std::string>& symbols) {
     std::vector<float> audio;
     for (const auto& sym : symbols) {
+        // 标点位置（{#N...} 停顿标记），切分后的段 duration 对标点预测可能为 0，需强制停顿
+        std::vector<int> punct_idx;
+        {
+            std::stringstream ss(sym);
+            std::string t;
+            int idx = 0;
+            while (ss >> t) {
+                if (t.size() >= 2 && t[0] == '{' && t[1] == '#') punct_idx.push_back(idx);
+                ++idx;
+            }
+        }
         auto in = frontend_->Encode(sym);
         auto t_stage = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[stage] encoded T=%d\n", in.T);
@@ -625,6 +636,22 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
                 durations[t] = (std::exp(log_dur[t]) - 1.0f) * speed;
                 reps[t] = (int)(durations[t] + 0.5f);
                 sum += reps[t];
+            }
+            // 标点强制停顿：#1/#3 顿/逗号 ≈0.12s（10 帧），#4 句号 ≈0.2s（16 帧）
+            for (int pi : punct_idx) {
+                if (pi >= T) continue;
+                int min_reps = 10;
+                if (pi + 1 < T) {
+                    // 看该标点符号内容：#4 句号停顿更长
+                    std::stringstream ss(sym);
+                    std::string t;
+                    for (int k = 0; k <= pi; ++k) ss >> t;
+                    if (t.size() >= 3 && t[1] == '#' && t[2] == '4') min_reps = 16;
+                }
+                if (reps[pi] < min_reps) {
+                    sum += min_reps - reps[pi];
+                    reps[pi] = min_reps;
+                }
             }
             std::fprintf(stderr, "[stage] speed=%.2f reps_sum=%d\n", speed, sum);
             if (std::getenv("KANTTS_DUMP_ENC")) {
