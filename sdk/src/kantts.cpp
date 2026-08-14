@@ -289,6 +289,141 @@ Frontend::EncInput Frontend::Encode(const std::string& symbol_seq) {
     return out;
 }
 
+void DepthwiseShift(const std::vector<float>& x, const std::vector<float>& wgt,
+                    int T, int C, int K, int lp, int rp, std::vector<float>& y) {
+    y.assign(T * C, 0.0f);
+    for (int c = 0; c < C; ++c)
+        for (int t = 0; t < T; ++t) {
+            float acc = 0;
+            for (int k = 0; k < K; ++k) {
+                int tt = t - lp + k;
+                if (tt < 0 || tt >= T) continue;
+                acc += x[tt * C + c] * wgt[c * K + k];
+            }
+            y[t * C + c] = acc;
+        }
+}
+
+
+void Blstm(const std::vector<float>& x, const Weights& w, const std::string& pre,
+           int T, int in_d, int units, std::vector<float>& y) {
+    const auto& wih = w.Get(pre + "_blstm_w_ih");
+    const auto& whh = w.Get(pre + "_blstm_w_hh");
+    const auto& bih = w.Get(pre + "_blstm_b_ih");
+    const auto& bhh = w.Get(pre + "_blstm_b_hh");
+    const auto& wihr = w.Get(pre + "_blstm_w_ih_r");
+    const auto& whhr = w.Get(pre + "_blstm_w_hh_r");
+    const auto& bihr = w.Get(pre + "_blstm_b_ih_r");
+    const auto& bhhr = w.Get(pre + "_blstm_b_hh_r");
+    std::vector<float> hf(units, 0), cf(units, 0), hb(units, 0), cb(units, 0);
+    y.assign(T * 2 * units, 0.0f);
+    std::vector<float> xi(in_d);
+    for (int t = 0; t < T; ++t) {
+        std::copy(x.begin() + t * in_d, x.begin() + (t + 1) * in_d, xi.begin());
+        LstmCell(xi, wih, whh, bih, bhh, hf, cf, units);
+        std::copy(hf.begin(), hf.end(), y.begin() + t * 2 * units);
+    }
+    for (int t = T - 1; t >= 0; --t) {
+        std::copy(x.begin() + t * in_d, x.begin() + (t + 1) * in_d, xi.begin());
+        LstmCell(xi, wihr, whhr, bihr, bhhr, hb, cb, units);
+        std::copy(hb.begin(), hb.end(), y.begin() + t * 2 * units + units);
+    }
+}
+
+std::vector<float> FsmnEncoder(const std::vector<float>& x, const Weights& w,
+                               const std::string& pre, int T, int C, const std::vector<int>& shift) {
+    std::vector<float> cur = x;
+    int layers = 0;
+    while (w.Has(pre + "_ffn" + std::to_string(layers) + "_w1")) ++layers;
+    for (int i = 0; i < layers; ++i) {
+        int mid = (int)w.Shape(pre + "_ffn" + std::to_string(i) + "_w1")[0];
+        std::vector<float> c1;
+        Conv1dSame(cur, w.Get(pre + "_ffn" + std::to_string(i) + "_w1"),
+                   w.Get(pre + "_ffn" + std::to_string(i) + "_b1"), T, C, mid, 1, c1);
+        for (auto& v : c1) v = std::max(v, 0.0f);
+        int out_c = (int)w.Shape(pre + "_ffn" + std::to_string(i) + "_w2")[0];
+        std::vector<float> c2;
+        Conv1dSame(c1, w.Get(pre + "_ffn" + std::to_string(i) + "_w2"),
+                   w.Get(pre + "_ffn" + std::to_string(i) + "_b2"), T, mid, out_c, 1, c2);
+        int fsize = (int)w.Shape(pre + "_mem" + std::to_string(i) + "_conv")[2];
+        int sh = shift.empty() ? 0 : shift[i];
+        int lp = (fsize - 1) / 2 + (sh > 0 ? sh : 0);
+        int rp = (fsize - 1) / 2 - (sh > 0 ? sh : 0);
+        std::vector<float> mem;
+        DepthwiseShift(c2, w.Get(pre + "_mem" + std::to_string(i) + "_conv"), T, out_c, fsize,
+                       lp, rp, mem);
+        for (int t = 0; t < T; ++t)
+            for (int c = 0; c < out_c; ++c) mem[t * out_c + c] += c2[t * out_c + c];
+        if (out_c == C)
+            for (int t = 0; t < T; ++t)
+                for (int c = 0; c < out_c; ++c) mem[t * out_c + c] += cur[t * C + c];
+        cur = mem;
+        C = out_c;
+    }
+    return cur;
+}
+
+std::vector<float> VarFsmnRnnPredictor(const std::vector<float>& x, const Weights& w,
+                                       const std::string& pre, int T, int in_d) {
+    std::vector<float> h = FsmnEncoder(x, w, pre, T, in_d, {0, 0, 0});
+    std::vector<float> bh;
+    Blstm(h, w, pre, T, 128, 128, bh);
+    std::vector<float> out(T);
+    const auto& fw = w.Get(pre + "_fc_w");
+    const auto& fb = w.Get(pre + "_fc_b");
+    for (int t = 0; t < T; ++t) {
+        float acc = fb[0];
+        for (int k = 0; k < 256; ++k) acc += bh[t * 256 + k] * fw[0 * 256 + k];
+        out[t] = acc;
+    }
+    return out;
+}
+
+std::vector<float> DurationAr(const std::vector<float>& cond, const Weights& w, int T, int in_d) {
+    std::vector<float> h0(128, 0), c0(128, 0), h1(128, 0), c1(128, 0);
+    std::vector<float> x(1, 0.0f), out(T);
+    const auto& p0w = w.Get("dur_pre0_w");
+    const auto& p0b = w.Get("dur_pre0_b");
+    const auto& p1w = w.Get("dur_pre1_w");
+    const auto& p1b = w.Get("dur_pre1_b");
+    const auto& fw = w.Get("dur_fc_w");
+    const auto& fb = w.Get("dur_fc_b");
+    std::vector<float> inp, tmp;
+    for (int t = 0; t < T; ++t) {
+        Matmul(x, p0w, p0b, 1, 1, 128, inp);
+        for (auto& v : inp) v = std::max(v, 0.0f);
+        Matmul(inp, p1w, p1b, 1, 128, 128, tmp);
+        for (auto& v : tmp) v = std::max(v, 0.0f);
+        std::vector<float> xin(tmp);
+        xin.insert(xin.end(), cond.begin() + t * in_d, cond.begin() + (t + 1) * in_d);
+        LstmCell(xin, w.Get("dur_lstm_w_ih0"), w.Get("dur_lstm_w_hh0"), w.Get("dur_lstm_b_ih0"),
+                 w.Get("dur_lstm_b_hh0"), h0, c0, 128);
+        LstmCell(h0, w.Get("dur_lstm_w_ih1"), w.Get("dur_lstm_w_hh1"), w.Get("dur_lstm_b_ih1"),
+                 w.Get("dur_lstm_b_hh1"), h1, c1, 128);
+        float acc = fb[0];
+        for (int k = 0; k < 128; ++k) acc += h1[k] * fw[0 * 128 + k];
+        x[0] = std::max(acc, 0.0f);
+        out[t] = x[0];
+    }
+    return out;
+}
+
+std::vector<float> Postnet(const std::vector<float>& dec, const Weights& w, int T) {
+    std::vector<float> x = FsmnEncoder(dec, w, "post", T, 80, {17, 17, 17, 17});
+    std::vector<float> h(128, 0), c(128, 0), out(T * 128);
+    std::vector<float> xi(256);
+    for (int t = 0; t < T; ++t) {
+        std::copy(x.begin() + t * 256, x.begin() + (t + 1) * 256, xi.begin());
+        LstmCell(xi, w.Get("post_lstm_w_ih"), w.Get("post_lstm_w_hh"), w.Get("post_lstm_b_ih"),
+                 w.Get("post_lstm_b_hh"), h, c, 128);
+        std::copy(h.begin(), h.end(), out.begin() + t * 128);
+    }
+    std::vector<float> res(T * 80);
+    Matmul(out, w.Get("post_fc_w"), w.Get("post_fc_b"), T, 128, 80, res);
+    for (int i = 0; i < T * 80; ++i) res[i] += dec[i];
+    return res;
+}
+
 namespace {
 
 // PNCA 单步解码（host）
@@ -515,6 +650,10 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
         auto t_stage = std::chrono::steady_clock::now();
         std::fprintf(stderr, "[stage] encoded T=%d\n", in.T);
         int T = in.T;
+        // 长句（超过 NPU duration 22 帧上限）自动回退 CPU 管线（pitch/energy/duration/postnet），
+        // 不切分整句直接合成，避免切分导致时长/停顿失真。
+        const bool use_cpu = T > 22;
+        if (use_cpu) std::fprintf(stderr, "[stage] 长句 T=%d -> CPU 管线\n", T);
         constexpr int MT = 128, D = 512, U = 32;
         const float* sy_w = w_.Get("sy_emb").data();      // (147,512)
         const float* tone_w = w_.Get("tone_emb").data();   // (10,512)
@@ -586,7 +725,7 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
             }
             std::fprintf(stderr, "[dbg] 使用参考 memory（%d 行）\n", (int)memory.size() / 160);
         } else {
-            // pitch/energy/duration 走 NPU
+            // pitch/energy：长句走 CPU（VarFsmnRnnPredictor），短句走 NPU
             std::vector<float> var_in(T * 96);
             for (int t = 0; t < T; ++t)
                 for (int c = 0; c < 32; ++c) {
@@ -595,12 +734,17 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
                     var_in[t * 96 + 64 + c] = emo_hid[t * 32 + c];
                 }
             std::vector<float> pitch(T), energy(T);
-            std::vector<float> var_pad(128 * 96, 0.0f);
-            std::copy(var_in.begin(), var_in.end(), var_pad.begin());
-            pe_->SetInput("var_in", var_pad.data(), var_pad.size() * 4);
-            pe_->Run();
-            pe_->GetOutput("pitch", pitch.data(), pitch.size() * 4);
-            pe_->GetOutput("energy", energy.data(), energy.size() * 4);
+            if (use_cpu) {
+                pitch = VarFsmnRnnPredictor(var_in, w_, "pitch", T, 96);
+                energy = VarFsmnRnnPredictor(var_in, w_, "energy", T, 96);
+            } else {
+                std::vector<float> var_pad(128 * 96, 0.0f);
+                std::copy(var_in.begin(), var_in.end(), var_pad.begin());
+                pe_->SetInput("var_in", var_pad.data(), var_pad.size() * 4);
+                pe_->Run();
+                pe_->GetOutput("pitch", pitch.data(), pitch.size() * 4);
+                pe_->GetOutput("energy", energy.data(), energy.size() * 4);
+            }
             std::vector<float> pe_c, ee_c;
             Conv1dSame(pitch, w_.Get("pitch_emb_w"), w_.Get("pitch_emb_b"), T, 1, 32, 9, pe_c);
             Conv1dSame(energy, w_.Get("energy_emb_w"), w_.Get("energy_emb_b"), T, 1, 32, 9, ee_c);
@@ -614,11 +758,15 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
                     cond[t * 96 + 64 + c] = emo_hid[t * 32 + c];
                 }
             std::vector<float> log_dur(T);
-            std::vector<float> cond_pad(22 * 96, 0.0f);
-            std::copy(cond.begin(), cond.end(), cond_pad.begin());
-            dur_->SetInput("cond", cond_pad.data(), cond_pad.size() * 4);
-            dur_->Run();
-            dur_->GetOutput("log_dur", log_dur.data(), log_dur.size() * 4);
+            if (use_cpu) {
+                log_dur = DurationAr(cond, w_, T, 96);
+            } else {
+                std::vector<float> cond_pad(22 * 96, 0.0f);
+                std::copy(cond.begin(), cond.end(), cond_pad.begin());
+                dur_->SetInput("cond", cond_pad.data(), cond_pad.size() * 4);
+                dur_->Run();
+                dur_->GetOutput("log_dur", log_dur.data(), log_dur.size() * 4);
+            }
             if (std::getenv("KANTTS_DUMP_ENC")) {
                 std::fprintf(stderr, "[dbg-npu] pitch[0..3]=%.4f %.4f %.4f %.4f energy[0..3]=%.4f %.4f %.4f %.4f log_dur[0..3]=%.4f %.4f %.4f %.4f\n",
                              pitch[0], pitch[1], pitch[2], pitch[3],
@@ -639,6 +787,7 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
             }
             // 标点强制停顿：#1/#3 顿/逗号 ≈0.12s（10 帧），#4 句号 ≈0.2s（16 帧）
             for (int pi : punct_idx) {
+                if (use_cpu) continue;
                 if (pi >= T) continue;
                 int min_reps = 10;
                 if (pi + 1 < T) {
@@ -781,7 +930,9 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
         std::fprintf(stderr, "[timing] decode %d 步 %.0fms\n", M, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_stage).count());
         t_stage = std::chrono::steady_clock::now();
         std::vector<float> mel;
-        {
+        if (use_cpu) {
+            mel = Postnet(dec_all, w_, M * 3);
+        } else {
             // postnet 模型固定 128 帧输入；M*3 可能超过 128，按 128 帧分块处理
             const int Tf = M * 3;
             for (int start = 0; start < Tf; start += 128) {
@@ -808,23 +959,21 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
         // voc 帧数 = memory 完整帧数（sum 非 3 倍数时 lr_len < M*3，需包含 pad 帧）
         mel.resize(M * 3 * 80);
         // voc 分块
-        const int C = 200, O = 40;
+        const int C = 200;
         int Tf = M * 3;
         for (int start = 0; start < Tf; start += C) {
             auto t_v = std::chrono::steady_clock::now();
             int end = std::min(start + C, Tf);
-            int cs = std::max(0, start - O);
             std::vector<float> chunk(80 * C, 0.0f);
-            for (int t = cs; t < end; ++t)
-                for (int c = 0; c < 80; ++c) chunk[c * C + (t - cs)] = mel[t * 80 + c];
+            for (int t = start; t < end; ++t)
+                for (int c = 0; c < 80; ++c) chunk[c * C + (t - start)] = mel[t * 80 + c];
             voc_->SetInput("mel", chunk.data(), chunk.size() * 4);
             voc_->Run();
             std::fprintf(stderr, "[timing] voc chunk %.0fms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-t_v).count());
             std::vector<float> wav(C * 200);
             voc_->GetOutput("wav", wav.data(), wav.size() * 4);
-            int keep0 = (start - cs) * 200;
             int keepn = (end - start) * 200;
-            audio.insert(audio.end(), wav.begin() + keep0, wav.begin() + keep0 + keepn);
+            audio.insert(audio.end(), wav.begin(), wav.begin() + keepn);
         }
     }
     // 句末拼接静音，避免尾音被听不清（0.3s @ 16k）
