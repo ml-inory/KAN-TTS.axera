@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <regex>
@@ -616,11 +617,16 @@ std::vector<float> KanttsPipeline::SynthesizeSymbols(
             durations.resize(T);
             int sum = 0;
             std::vector<int> reps(T);
+            // 语速控制：默认放慢 1.4 倍（KANTTS_SPEED 可调，1.0=原速）
+            float speed = 1.4f;
+            if (const char* sp = std::getenv("KANTTS_SPEED")) speed = std::atof(sp);
+            if (speed <= 0.05f) speed = 1.0f;
             for (int t = 0; t < T; ++t) {
-                durations[t] = std::exp(log_dur[t]) - 1.0f;
+                durations[t] = (std::exp(log_dur[t]) - 1.0f) * speed;
                 reps[t] = (int)(durations[t] + 0.5f);
                 sum += reps[t];
             }
+            std::fprintf(stderr, "[stage] speed=%.2f reps_sum=%d\n", speed, sum);
             if (std::getenv("KANTTS_DUMP_ENC")) {
                 std::fprintf(stderr, "[dbg-npu] log_dur all:");
                 for (int t = 0; t < T; ++t) std::fprintf(stderr, " %.3f", log_dur[t]);
